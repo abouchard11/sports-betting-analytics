@@ -1,0 +1,89 @@
+name: Validate App Specs
+
+on:
+  pull_request:
+    paths:
+      - '.do/*.yaml'
+      - '.do/*.yml'
+
+jobs:
+  find-changes:
+    name: Identify Changed App Specs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # fetch all history of all branches
+      - id: files
+        name: Get Changed Files
+        uses: jitterbit/get-changed-files@v1
+      - name: Filter Changed Files
+        id: filtered_files
+        run: |
+          files_array=()
+          if [ -z "${{ steps.files.outputs.added_modified }}" ]; then
+            files_json="[]"
+          else
+            for changed_file in ${{ steps.files.outputs.added_modified }}; do
+              if [[ "$changed_file" == .do/*.yaml || "$changed_file" == .do/*.yml ]] && [[ "$changed_file" != .do/*.template.yaml ]]; then
+                files_array+=("$changed_file")
+              fi
+            done
+
+            if [ ${#files_array[@]} -eq 0 ]; then
+              files_json="[]"
+            else
+              files_json=$(printf '%s\n' "${files_array[@]}" | jq -R . | jq -s .)
+            fi
+          fi
+
+          echo "Collected files: $files_json"
+          echo "added_modified="$files_json"" >> $GITHUB_OUTPUT
+    outputs:
+      added_modified: ${{ steps.filtered_files.outputs.added_modified }}
+
+  propose-app-spec:
+    needs: find-changes
+    name: Validate App Spec -  ${{ matrix.file }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        file: ${{ fromJSON(needs.find-changes.outputs.added_modified) }}
+    environment: propose-app-spec
+    steps:
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Propose App Spec (new app)
+        run: doctl apps propose --spec "${{ matrix.file }}"
+      - name: Extract Components
+        id: extract-components
+        run: |
+          components="$(cat "${{ matrix.file }}" | yq --output-format=json '[ .services[].name, .workers[].name, .jobs[].name, .static_sites[].name ]' )"
+
+          echo "Collected components: $components"
+          echo "components_to_build="{file: \"${{ matrix.file }}\", components: $components }"" >> $GITHUB_OUTPUT
+    outputs:
+      components_to_build: ${{ steps.extract-components.outputs.components_to_build }}
+
+  test-app-build:
+    name: Local App Build -  ${{ fromJSON(needs.propose-app-spec.outputs.components_to_build).file }} - ${{ matrix.component }}
+    runs-on: ubuntu-latest
+    needs: propose-app-spec
+    strategy:
+      matrix:
+        component: ${{ fromJSON(needs.propose-app-spec.outputs.components_to_build).components }}
+    environment: propose-app-spec
+    steps:
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Perform `doctl apps dev build`
+        run: doctl apps dev build --no-cache --spec "${{ fromJSON(needs.propose-app-spec.outputs.components_to_build).file }}" "${{ matrix.component }}"
